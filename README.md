@@ -171,13 +171,180 @@ companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
 ## Homework 3 solution:
-> to students: this is your report, see the homework description.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+I chose points 1, 5 and 11. The first two give the analysis a quantitative
+foundation, while point 11 adds Fisher's qualitative, long-horizon view of
+competitive position. This mix avoids asking the language model to perform
+financial arithmetic and uses the interview tools only where qualitative
+interpretation is genuinely useful.
+
+#### Point 1: Market potential for sales growth
+
+I chose this point because a long-term investment needs a business whose market
+can support several years of expansion. The database contains full-year orders
+from 2023 through 2025 and a comparable two-year growth benchmark for each
+industry. PASS means that FY2025 revenue is at least the industry median
+two-year growth rate above FY2023 revenue. The calculation uses
+`SUM(amount)` over the `orders` table and compares the result with
+`industry_medians.revenue_growth_2y_pct`. Fisher's emphasis on "sufficient market
+potential" requires more than one strong period, so the rule deliberately uses a
+multi-year comparison rather than a single quarter.
+
+#### Point 5: Worthwhile profit margin
+
+I chose this point because growth without an attractive operating margin can
+destroy rather than create shareholder value. PASS means that FY2025 operating
+margin is no lower than the median operating margin for the company's industry.
+The rule computes:
+
+```text
+(FY2025 revenue - cost of sales - selling and admin - R&D)
+/ FY2025 revenue
+```
+
+It uses `orders` for revenue, `monthly_costs` for the three cost categories, and
+`industry_medians.operating_margin_pct` for the benchmark. Using the industry
+median prevents the verdict from relying on an arbitrary absolute percentage
+that would treat capital-intensive and asset-light industries identically.
+
+#### Point 11: Advantage over competitors
+
+I chose this point because it focuses on durable competitive position rather
+than a single operational capability. Fisher asks about "other aspects of the
+business, somewhat peculiar to the industry involved" that reveal whether a
+company is outstanding relative to competitors. PASS requires an interview to
+identify a concrete, company-specific advantage that rivals would struggle to
+copy quickly, such as proprietary technology, a strong brand, switching costs,
+scale, a structural cost advantage, or privileged supply or distribution access.
+Merely being competent, competing mainly on price, or offering an easily copied
+feature is FAIL. The evidence comes from
+`interview("competitor", "competitive_edge")`; if that answer is unavailable, the
+agent asks a customer about the same topic.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A[Company-specific LangChain tools] --> B[Deterministic SQL branch]
+    A --> C[Scuttlebutt interview branch]
+    B --> D[Point 1<br/>Revenue growth vs industry median]
+    B --> E[Point 5<br/>Operating margin vs industry median]
+    C --> F[competitor / competitive_edge]
+    F --> G[DeepSeek strict PASS-FAIL classifier]
+    D --> H[Verdict assembler]
+    E --> H
+    G --> H
+    H --> I[DeepSeek evidence-only summary]
+    I --> J[Per-company result]
+    J --> K[results.csv]
+```
+
+The agent routes each Fisher point to the source that matches the assignment.
+Points 1 and 5 use fixed SQL queries, and SQLite returns both verdicts and the
+underlying figures, so financial arithmetic never depends on the model. Point 11
+uses one known-informative competitor interview and a constrained classifier
+prompt. The classifier is instructed to PASS only concrete, hard-to-copy relative
+advantages and to treat parity, price-only competition and easily imitated
+features as FAIL. It returns a structured assessment containing whether a
+relative advantage exists, whether that advantage is durable, a reason, and a
+verbatim evidence quote. The code verifies that the quote occurs in the interview
+and assigns PASS only when both model judgments are affirmative. A second
+`deepseek-v4-flash` call writes a two-to-three-sentence summary from the three
+verdicts and collected evidence only. Companies are processed concurrently with
+a bounded semaphore, and each company has its own fallback so one failed API call
+or tool invocation cannot prevent `results.csv` from being produced.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+The final implementation was run three times on all 20 public companies with:
+
+```bash
+python3 hw3.py --data-folder public_test
+```
+
+| Run | Correct points | Balanced score | Runtime |
+| --- | ---: | ---: | ---: |
+| 1 | 60/60 | 100.0% | 17.576 s |
+| 2 | 60/60 | 100.0% | 19.262 s |
+| 3 | 60/60 | 100.0% | 18.669 s |
+
+No company disagreed with the public answer key in the final runs, and no model
+or tool call fell back to an error result. The stable score shows that the three
+queries and classifier rules are reliable on the public set, although the
+private set remains the more important test of generalization.
+
+During validation, an earlier point 11 version produced seven false negatives.
+In each case the interview said customers commonly return after trying a rival,
+but the classifier required an additional named mechanism such as a patent or
+switching cost. That was inconsistent with the assignment's statement that one
+clear answer from an informed interviewee is sufficient. The final rubric treats
+repeated customer return as evidence of revealed preference and stickiness
+unless the interview explicitly describes the return as temporary or
+promotion-driven. After this calibration, the agent still reasons from the
+interview text; it does not map company names or public answers to verdicts.
+
+## Task 2: Reflection on AI-Sycophancy and AI-Psychosis
+
+In this reflection I use "AI-psychosis" as a non-clinical shorthand for a model
+or user losing contact with the evidence: the system keeps producing confident
+text after its reasoning has become detached from reality. AI-sycophancy is the
+related tendency to agree with the user's framing, praise weak ideas, or present
+the answer the user appears to want. Both problems are dangerous in investment
+research because fluent language can make an unsupported conclusion feel like
+analysis.
+
+This homework made the risk concrete. When the first point 11 classifier
+disagreed with the public answers, it was tempting to add more phrases until the
+score reached 100%. That improved the public result, but it also moved the agent
+away from the actual task. The agent was no longer becoming better at judging a
+competitive advantage; it was becoming better at recognizing the public set.
+This is a form of sycophancy toward the evaluation metric. The model and the
+developer can both fall into it: the score agrees with the rule, the rule agrees
+with the expected answers, and everyone stops asking whether the conclusion is
+grounded in evidence.
+
+The same temptation appears at the model level. A helpful-sounding assistant may
+accept a company's management claims at face value, call every positive statement
+a competitive advantage, or avoid saying that the evidence is insufficient. In
+Fisher's framework this would be especially harmful. Management documents are
+not independent evidence, and a polite interview answer is not automatically a
+moat. A useful agent needs to distinguish a concrete relative advantage from
+ordinary competence, a temporary price advantage, and a friendly but empty
+compliment. It should also be allowed to reject an interview that does not
+support the claim.
+
+AI-psychosis in the evidence-grounded sense is the next step after sycophancy.
+The model can start from a plausible label and then generate an increasingly
+elaborate explanation that no longer matches the source. In an investment
+context, fabricated switching costs, imagined management credibility, or a
+confident summary built from missing evidence can all look convincing. The
+danger is not limited to obvious factual errors. It also includes reasoning
+loops in which each model output becomes the premise for the next one, until the
+agent is arguing with itself instead of interrogating the company.
+
+The final design tries to interrupt both failure modes with evidence discipline.
+SQL returns the financial verdicts and their numbers, so the model does not do
+arithmetic by memory. Point 11 uses the interview tool, requires a structured
+judgment, and checks that the quoted evidence occurs in the interview. The
+summary is instructed to use only the supplied verdicts and evidence. These
+controls do not make the agent infallible, but they make unsupported claims
+harder to disguise as complete reasoning.
+
+The most important lesson is that evaluation is not the same as understanding.
+Public answers are useful for calibration, but a perfect public score can still
+hide overfitting. I would prefer a less certain agent that refuses to invent a
+mechanism over a fluent agent that produces the expected label for the wrong
+reason. In real use, I would add source citations, retries with evidence
+validation, independent review for ambiguous cases, and an explicit abstention
+state for insufficient evidence. Those safeguards matter more than an extra
+percentage point on a visible test set.
+
+AI can be genuinely useful in this process because it can read many sources,
+organize competing signals, and challenge a preliminary judgment. It becomes
+dangerous when it is rewarded for sounding certain rather than being correct, or
+when users treat a polished answer as a substitute for evidence. The goal should
+not be an agent that agrees with the user or the answer key. The goal should be
+an agent whose conclusions can be traced back to the company's data, interviews,
+and clearly stated Fisher rules.

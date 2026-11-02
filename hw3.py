@@ -7,16 +7,24 @@ import argparse
 import asyncio
 import csv
 import json
+import re
 import sqlite3
+import sys
 import threading
 import zlib
+from collections import Counter
 from pathlib import Path
 from typing import Any
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_deepseek import ChatDeepSeek
 
 
 MODEL_NAME = "deepseek-v4-flash"
 INTERVIEW_LIMIT = 10
 MAX_SQL_ROWS = 50
+MAX_CONCURRENT_COMPANIES = 5
+MODEL_TIMEOUT_SECONDS = 90
 
 # Philip Fisher, "Common Stocks and Uncommon Profits", Part One, Chapter 3.
 # For every point, PASS means the company looks good on it. You choose 3
@@ -57,7 +65,254 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 5, 11]
+
+POINT_1_SQL = """
+WITH annual AS (
+    SELECT substr(order_date, 1, 4) AS year,
+           SUM(amount) AS revenue
+    FROM orders
+    WHERE substr(order_date, 1, 4) IN ('2023', '2025')
+    GROUP BY substr(order_date, 1, 4)
+),
+company_metric AS (
+    SELECT 100.0 * (
+        MAX(CASE WHEN year = '2025' THEN revenue END) /
+        NULLIF(MAX(CASE WHEN year = '2023' THEN revenue END), 0) - 1
+    ) AS company_value
+    FROM annual
+),
+benchmark AS (
+    SELECT im.revenue_growth_2y_pct AS industry_value
+    FROM company AS c
+    JOIN industry_medians AS im ON im.industry = c.industry
+    LIMIT 1
+)
+SELECT
+    CASE
+        WHEN cm.company_value IS NOT NULL
+         AND b.industry_value IS NOT NULL
+         AND cm.company_value >= b.industry_value
+        THEN 'PASS'
+        ELSE 'FAIL'
+    END AS verdict,
+    ROUND(cm.company_value, 2) AS company_value,
+    ROUND(b.industry_value, 2) AS industry_median,
+    'FY2025 vs FY2023 revenue growth (%)' AS metric
+FROM company_metric AS cm
+CROSS JOIN benchmark AS b
+"""
+
+POINT_5_SQL = """
+WITH annual_revenue AS (
+    SELECT SUM(amount) AS revenue
+    FROM orders
+    WHERE substr(order_date, 1, 4) = '2025'
+),
+annual_costs AS (
+    SELECT SUM(cost_of_sales) AS cost_of_sales,
+           SUM(selling_admin) AS selling_admin,
+           SUM(research_development) AS research_development
+    FROM monthly_costs
+    WHERE substr(month, 1, 4) = '2025'
+),
+company_metric AS (
+    SELECT 100.0 * (
+        r.revenue - c.cost_of_sales - c.selling_admin - c.research_development
+    ) / NULLIF(r.revenue, 0) AS company_value
+    FROM annual_revenue AS r
+    CROSS JOIN annual_costs AS c
+),
+benchmark AS (
+    SELECT im.operating_margin_pct AS industry_value
+    FROM company AS c
+    JOIN industry_medians AS im ON im.industry = c.industry
+    LIMIT 1
+)
+SELECT
+    CASE
+        WHEN cm.company_value IS NOT NULL
+         AND b.industry_value IS NOT NULL
+         AND cm.company_value >= b.industry_value
+        THEN 'PASS'
+        ELSE 'FAIL'
+    END AS verdict,
+    ROUND(cm.company_value, 2) AS company_value,
+    ROUND(b.industry_value, 2) AS industry_median,
+    'FY2025 operating margin (%)' AS metric
+FROM company_metric AS cm
+CROSS JOIN benchmark AS b
+"""
+
+COMPETITIVE_EDGE_SYSTEM_PROMPT = """
+You are evaluating whether a company has a durable advantage over competitors
+under Fisher point 11. Use only the supplied interview excerpt and no outside
+knowledge.
+
+First determine whether the speaker explicitly compares the company favorably
+with competitors. A generic compliment is not a relative advantage. Then assess
+whether the evidence shows that the advantage is durable rather than merely
+temporary or easily copied. Consider factors such as proprietary technology,
+brand, customer switching costs, scale, structural cost advantage, privileged
+supply or distribution, and regulatory or certification barriers. Do not equate
+a patent or installed base with a durable advantage when the evidence indicates
+that the protection is expiring or the advantage is easily bypassed.
+
+Concrete customer behavior is evidence too. If customers commonly try a rival
+and then return to the company, treat that repeated revealed preference as
+evidence of a durable relative advantage unless the excerpt says the return is
+only promotional, temporary, or forced by an expiring constraint. Do not require
+the interview to name an additional technical or brand mechanism when the
+behavioral evidence itself is clear. One clear answer from an informed person is
+sufficient; do not require corroboration from another interview.
+
+Return one JSON object only, with exactly these fields:
+{
+  "has_relative_advantage": true or false,
+  "advantage_basis": "short description",
+  "hard_to_copy": true or false,
+  "evidence_quote": "verbatim consecutive words from the interview",
+  "reason": "one or two sentences tying the quote to the decision"
+}
+""".strip()
+
+COMPETITIVE_EDGE_RETRY_PROMPT = """
+Your previous response was not valid JSON for Fisher point 11. Re-evaluate the
+interview using only the excerpt. Return one JSON object only and do not use
+Markdown. The required fields are has_relative_advantage (boolean),
+advantage_basis (string), hard_to_copy (boolean), evidence_quote (a verbatim
+consecutive passage from the interview), and reason (string).
+""".strip()
+
+SUMMARY_SYSTEM_PROMPT = """
+Write a concise English investment-research summary using only the supplied
+verdicts and evidence. Use two or three sentences. State the PASS or FAIL result
+for all three Fisher points and explain each with the supplied figures or
+interview evidence. Do not add outside facts, make forecasts, or invent metrics.
+Return only the summary.
+""".strip()
+
+def _message_text(message: Any) -> str:
+    """Extract plain text from a LangChain message or raw model response."""
+    content = getattr(message, "content", message)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part).strip()
+    return str(content).strip()
+
+
+async def _call_model(model: ChatDeepSeek, system_prompt: str, user_prompt: str) -> str:
+    response = await asyncio.wait_for(
+        model.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]),
+        timeout=MODEL_TIMEOUT_SECONDS,
+    )
+    return _message_text(response)
+
+
+def _parse_sql_metric(raw: str) -> dict[str, str]:
+    lines = [line.strip() for line in raw.strip().splitlines() if line.strip()]
+    if not lines or lines[0].startswith(("SQL error:", "Query returned no columns")):
+        raise ValueError(lines[0] if lines else "empty SQL response")
+    if len(lines) < 2 or lines[1].startswith("("):
+        raise ValueError("SQL metric returned no data row")
+    header = [item.strip() for item in lines[0].split("|")]
+    values = [item.strip() for item in lines[1].split("|")]
+    if len(header) != len(values):
+        raise ValueError("malformed SQL tool output")
+    row = dict(zip(header, values))
+    verdict = row.get("verdict", "").upper()
+    if verdict not in VERDICTS:
+        raise ValueError("SQL metric did not return a valid verdict")
+    return row
+
+
+def _parse_edge_assessment(raw: str, evidence: str) -> dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("classifier did not return a JSON object")
+    assessment = json.loads(text[start:end + 1])
+
+    has_advantage = assessment.get("has_relative_advantage")
+    hard_to_copy = assessment.get("hard_to_copy")
+    quote = assessment.get("evidence_quote")
+    if not isinstance(has_advantage, bool) or not isinstance(hard_to_copy, bool):
+        raise ValueError("classifier boolean fields are invalid")
+    if not isinstance(quote, str) or not quote.strip():
+        raise ValueError("classifier did not provide an evidence quote")
+
+    compact_quote = " ".join(quote.casefold().split()).strip(" \"'")
+    compact_evidence = " ".join(evidence.casefold().split())
+    if len(compact_quote.split()) < 3 or compact_quote not in compact_evidence:
+        raise ValueError("classifier evidence quote is not in the interview")
+
+    return {
+        "has_relative_advantage": has_advantage,
+        "advantage_basis": str(assessment.get("advantage_basis", "")).strip(),
+        "hard_to_copy": hard_to_copy,
+        "evidence_quote": quote.strip(),
+        "reason": str(assessment.get("reason", "")).strip(),
+        "verdict": "PASS" if has_advantage and hard_to_copy else "FAIL",
+    }
+
+
+async def _assess_competitive_edge(
+    model: ChatDeepSeek,
+    evidence: str,
+) -> dict[str, Any]:
+    prompt = f"Interview excerpt:\n{evidence[:2400]}"
+    raw = await _call_model(model, COMPETITIVE_EDGE_SYSTEM_PROMPT, prompt)
+    try:
+        return _parse_edge_assessment(raw, evidence)
+    except (ValueError, json.JSONDecodeError):
+        retry = await _call_model(
+            model,
+            COMPETITIVE_EDGE_RETRY_PROMPT,
+            f"{prompt}\n\nInvalid response to correct:\n{raw[:1200]}",
+        )
+        return _parse_edge_assessment(retry, evidence)
+
+
+def _exception_label(exc: Exception) -> str:
+    status = getattr(exc, "status_code", None)
+    suffix = f"(status={status})" if status is not None else ""
+    return f"{type(exc).__name__}{suffix}"
+
+
+def _format_metric(point: int, name: str, row: dict[str, str]) -> str:
+    return (
+        f"Point {point} ({name}): {row['verdict']}. "
+        f"Company {row['metric']} = {row['company_value']}; "
+        f"industry median = {row['industry_median']}."
+    )
+
+
+def _fallback_summary(
+    growth: dict[str, str],
+    margin: dict[str, str],
+    edge_verdict: str,
+    interview_text: str,
+) -> str:
+    excerpt = " ".join(interview_text.split())[:320]
+    return (
+        f"Point 1 is {growth['verdict']}: two-year revenue growth is "
+        f"{growth['company_value']}% versus an industry median of "
+        f"{growth['industry_median']}%. Point 5 is {margin['verdict']}: the "
+        f"FY2025 operating margin is {margin['company_value']}% versus "
+        f"{margin['industry_median']}%. Point 11 is {edge_verdict}; the "
+        f"competitive-edge interview reported: {excerpt}"
+    )
 
 
 def build_agent() -> Any:
@@ -71,8 +326,22 @@ def build_agent() -> Any:
     from .env. Each company has its own tools (see ``analyze_companies``), so
     you will probably create one tool-calling agent per company there.
     """
-    ### YOUR CODE HERE
-    return None
+    return {
+        "classifier": ChatDeepSeek(
+            model=MODEL_NAME,
+            temperature=0,
+            max_tokens=None,
+            timeout=MODEL_TIMEOUT_SECONDS,
+            max_retries=2,
+        ),
+        "writer": ChatDeepSeek(
+            model=MODEL_NAME,
+            temperature=0,
+            max_tokens=None,
+            timeout=MODEL_TIMEOUT_SECONDS,
+            max_retries=2,
+        ),
+    }
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -108,9 +377,110 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     entry for it: an exception here means no results.csv, which scores zero.
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_COMPANIES)
+    model_diagnostics: list[str] = []
+
+    async def analyze_one(name: str, company_tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            try:
+                tools = {langchain_tool.name: langchain_tool for langchain_tool in company_tools}
+                sql_tool = tools["sql_query"]
+                interview_tool = tools["interview"]
+
+                try:
+                    growth = _parse_sql_metric(await sql_tool.ainvoke({"query": POINT_1_SQL}))
+                except Exception as exc:
+                    growth = {
+                        "verdict": "FAIL",
+                        "metric": "FY2025 vs FY2023 revenue growth (%)",
+                        "company_value": "unavailable",
+                        "industry_median": "unavailable",
+                        "error": type(exc).__name__,
+                    }
+
+                try:
+                    margin = _parse_sql_metric(await sql_tool.ainvoke({"query": POINT_5_SQL}))
+                except Exception as exc:
+                    margin = {
+                        "verdict": "FAIL",
+                        "metric": "FY2025 operating margin (%)",
+                        "company_value": "unavailable",
+                        "industry_median": "unavailable",
+                        "error": type(exc).__name__,
+                    }
+
+                edge_evidence = str(
+                    await interview_tool.ainvoke({
+                        "role": "competitor",
+                        "topic": "competitive_edge",
+                    })
+                ).strip()
+                if "comment" in edge_evidence.lower() and "cannot" in edge_evidence.lower():
+                    edge_evidence = str(
+                        await interview_tool.ainvoke({
+                            "role": "customer",
+                            "topic": "competitive_edge",
+                        })
+                    ).strip()
+
+                try:
+                    edge_assessment = await _assess_competitive_edge(
+                        agent["classifier"],
+                        edge_evidence,
+                    )
+                    edge_verdict = edge_assessment["verdict"]
+                except Exception as exc:
+                    model_diagnostics.append(f"classifier={_exception_label(exc)}")
+                    edge_assessment = {
+                        "has_relative_advantage": None,
+                        "advantage_basis": "",
+                        "hard_to_copy": None,
+                        "evidence_quote": "",
+                        "reason": "The classifier did not provide a valid assessment.",
+                        "verdict": "FAIL",
+                    }
+                    edge_verdict = "FAIL"
+
+                points = {1: growth["verdict"], 5: margin["verdict"], 11: edge_verdict}
+                evidence = "\n".join([
+                    _format_metric(1, "market growth potential", growth),
+                    _format_metric(5, "worthwhile profit margin", margin),
+                    f"Point 11 (competitive edge): {edge_verdict}. "
+                    f"Assessment: {edge_assessment['reason']} "
+                    f"Evidence: {' '.join(edge_evidence.split())[:1200]}",
+                ])
+
+                try:
+                    summary = await _call_model(
+                        agent["writer"],
+                        SUMMARY_SYSTEM_PROMPT,
+                        f"Verdicts: {points}\nEvidence:\n{evidence}",
+                    )
+                    summary = " ".join(summary.split())
+                    if not summary:
+                        raise ValueError("empty summary")
+                except Exception as exc:
+                    model_diagnostics.append(f"writer={_exception_label(exc)}")
+                    summary = _fallback_summary(growth, margin, edge_verdict, edge_evidence)
+
+                return name, {"points": points, "summary": summary}
+            except Exception as exc:
+                return name, {
+                    "points": {1: "FAIL", 5: "FAIL", 11: "FAIL"},
+                    "summary": (
+                        "Analysis could not complete for this company "
+                        f"({type(exc).__name__}). Conservative FAIL verdicts returned."
+                    ),
+                }
+
+    results = await asyncio.gather(
+        *(analyze_one(name, tools) for name, tools in companies.items())
+    )
+    if model_diagnostics:
+        counts = Counter(model_diagnostics)
+        details = ", ".join(f"{label} x{count}" for label, count in sorted(counts.items()))
+        print(f"Model-call diagnostics: {details}", file=sys.stderr)
+    return dict(results)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
